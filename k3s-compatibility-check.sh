@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================
 # k3s_check.sh — K3s Compatibility Checker (READ-ONLY)
-# No changes are made to the host. Safe to pipe directly:
+# Makes NO changes to the host. Safe to run via:
 #   curl -sSL https://raw.githubusercontent.com/<USER>/<REPO>/main/k3s_check.sh | sudo bash
 # ==============================================================
 
@@ -16,38 +16,50 @@ ERRORS=0
 WARNINGS=0
 
 pass()   { echo -e "    ${GREEN}[PASS]${NC} $1"; }
-fail()   { echo -e "    ${RED}[FAIL]${NC} $1"; ERRORS=$((ERRORS+1)); }
-warn()   { echo -e "    ${YELLOW}[WARN]${NC} $1"; WARNINGS=$((WARNINGS+1)); }
+fail()   { echo -e "    ${RED}[FAIL]${NC} $1"; ERRORS=$((ERRORS + 1)); }
+warn()   { echo -e "    ${YELLOW}[WARN]${NC} $1"; WARNINGS=$((WARNINGS + 1)); }
 info()   { echo -e "    ${BLUE}[INFO]${NC} $1"; }
 header() { echo -e "\n${BOLD}${BLUE}[$1] $2${NC}"; }
+
+# Safe integer check — returns 0 if string is a valid integer, 1 otherwise
+is_int() { echo "$1" | grep -qE '^[0-9]+$'; }
 
 echo ""
 echo -e "${BOLD}============================================================${NC}"
 echo -e "${BOLD}       K3s Compatibility Checker  —  READ ONLY             ${NC}"
 echo -e "${BOLD}============================================================${NC}"
-echo -e " Host : $(hostname)"
-echo -e " Date : $(date '+%Y-%m-%d %H:%M:%S')"
+echo -e " Host : $(hostname 2>/dev/null || echo unknown)"
+echo -e " Date : $(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo unknown)"
 echo -e "${BOLD}============================================================${NC}"
 
 # ── 1. Kernel Version ────────────────────────────────────────
 header 1 "Kernel Version"
-KERNEL=$(uname -r)
+KERNEL=$(uname -r 2>/dev/null || echo "0.0.0")
 KM=$(echo "$KERNEL" | cut -d'.' -f1)
 Km=$(echo "$KERNEL" | cut -d'.' -f2)
 info "Running kernel: $KERNEL"
-if [ "$KM" -gt 5 ] 2>/dev/null || { [ "$KM" -eq 5 ] 2>/dev/null && [ "$Km" -ge 4 ] 2>/dev/null; }; then
-    pass "Kernel >= 5.4 — compatible with K3s"
+
+# Strip any non-numeric suffix (e.g. "5.15.0-91-generic" -> "15")
+KM=$(echo "$KM" | grep -oE '^[0-9]+' || echo 0)
+Km=$(echo "$Km" | grep -oE '^[0-9]+' || echo 0)
+
+if is_int "$KM" && is_int "$Km"; then
+    if [ "$KM" -gt 5 ] || { [ "$KM" -eq 5 ] && [ "$Km" -ge 4 ]; }; then
+        pass "Kernel $KERNEL >= 5.4 — compatible with K3s"
+    else
+        fail "Kernel $KERNEL is too old — K3s requires >= 5.4"
+    fi
 else
-    fail "Kernel $KERNEL is too old — K3s requires >= 5.4"
+    warn "Could not parse kernel version: $KERNEL"
 fi
 
 # ── 2. Kernel Modules ────────────────────────────────────────
 header 2 "Required Kernel Modules"
 for MOD in overlay nf_conntrack ip_tables br_netfilter; do
-    if lsmod 2>/dev/null | grep -q "^${MOD}"; then
+    if lsmod 2>/dev/null | grep -q "^${MOD}[[:space:]]"; then
         pass "$MOD — loaded"
     else
-        fail "$MOD — NOT loaded  →  fix: modprobe $MOD"
+        fail "$MOD — NOT loaded  (fix: modprobe $MOD)"
     fi
 done
 
@@ -60,10 +72,20 @@ else
 fi
 
 if [ -f /proc/cgroups ]; then
-    CPU_CG=$(awk '/^cpu[[:space:]]/{print $4}' /proc/cgroups 2>/dev/null || echo 0)
-    MEM_CG=$(awk '/^memory/{print $4}'          /proc/cgroups 2>/dev/null || echo 0)
-    [ "$CPU_CG" = "1" ] && pass "cpu cgroup enabled"    || fail "cpu cgroup disabled"
-    [ "$MEM_CG" = "1" ] && pass "memory cgroup enabled" || fail "memory cgroup disabled — add cgroup_memory=1 cgroup_enable=memory to kernel cmdline"
+    CPU_CG=$(awk '/^cpu[[:space:]]/{print $4}' /proc/cgroups 2>/dev/null)
+    MEM_CG=$(awk '/^memory[[:space:]]/{print $4}' /proc/cgroups 2>/dev/null)
+    CPU_CG=${CPU_CG:-0}
+    MEM_CG=${MEM_CG:-0}
+    if [ "$CPU_CG" = "1" ]; then
+        pass "cpu cgroup enabled"
+    else
+        fail "cpu cgroup disabled"
+    fi
+    if [ "$MEM_CG" = "1" ]; then
+        pass "memory cgroup enabled"
+    else
+        fail "memory cgroup disabled — add cgroup_memory=1 cgroup_enable=memory to kernel cmdline"
+    fi
 else
     warn "/proc/cgroups not found"
 fi
@@ -74,36 +96,49 @@ else
     info "cgroup v1 detected"
 fi
 
-# ── 4. Sysctl Params ─────────────────────────────────────────
+# ── 4. Sysctl ────────────────────────────────────────────────
 header 4 "Sysctl / Networking Params"
 check_sysctl() {
-    KEY=$1; EXP=$2
-    VAL=$(sysctl -n "$KEY" 2>/dev/null || echo "missing")
+    KEY=$1
+    EXP=$2
+    VAL=$(sysctl -n "$KEY" 2>/dev/null)
+    VAL=${VAL:-missing}
     if [ "$VAL" = "$EXP" ]; then
         pass "$KEY = $VAL"
     else
-        fail "$KEY = $VAL  (expected $EXP)  →  fix: sysctl -w $KEY=$EXP"
+        fail "$KEY = $VAL  (expected $EXP)  —  fix: sysctl -w $KEY=$EXP"
     fi
 }
 check_sysctl net.ipv4.ip_forward                 1
 check_sysctl net.bridge.bridge-nf-call-iptables  1
 check_sysctl net.bridge.bridge-nf-call-ip6tables 1
 
-# ── 5. Firewall ──────────────────────────────────────────────
+# ── 5. Firewall & iptables ───────────────────────────────────
 header 5 "Firewall & iptables"
+
 if systemctl is-active firewalld >/dev/null 2>&1; then
     warn "firewalld is active — ensure TCP 6443, UDP 8472, TCP 10250 are open"
 else
     pass "firewalld not active"
 fi
 
-if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "active"; then
+UFW_ACTIVE=0
+if command -v ufw >/dev/null 2>&1; then
+    if ufw status 2>/dev/null | grep -q "Status: active"; then
+        UFW_ACTIVE=1
+    fi
+fi
+if [ "$UFW_ACTIVE" -eq 1 ]; then
     warn "ufw is active — ensure TCP 6443, UDP 8472, TCP 10250 are allowed"
 else
     pass "ufw not active"
 fi
 
-DROP_COUNT=$(iptables -L -n 2>/dev/null | grep -c "DROP" || echo 0)
+DROP_RAW=$(iptables -L -n 2>/dev/null | grep -c "DROP")
+DROP_COUNT=${DROP_RAW:-0}
+if ! is_int "$DROP_COUNT"; then
+    DROP_COUNT=0
+fi
 if [ "$DROP_COUNT" -gt 0 ]; then
     warn "$DROP_COUNT DROP rule(s) in iptables — may block image pulls"
 else
@@ -124,7 +159,8 @@ done
 header 7 "HTTPS Connectivity to Registries"
 if command -v curl >/dev/null 2>&1; then
     for URL in https://registry-1.docker.io https://ghcr.io https://registry.k8s.io https://quay.io; do
-        CODE=$(curl -o /dev/null -s -w "%{http_code}" --max-time 6 "$URL" 2>/dev/null || echo "000")
+        CODE=$(curl -o /dev/null -s -w "%{http_code}" --connect-timeout 6 --max-time 10 "$URL" 2>/dev/null)
+        CODE=${CODE:-000}
         if [ "$CODE" != "000" ]; then
             pass "Reachable ($CODE): $URL"
         else
@@ -138,7 +174,8 @@ fi
 # ── 8. Container Runtime ─────────────────────────────────────
 header 8 "Container Runtime"
 if command -v containerd >/dev/null 2>&1; then
-    pass "containerd installed: $(containerd --version 2>/dev/null | head -1)"
+    CTR_VER=$(containerd --version 2>/dev/null | head -1 || echo "unknown")
+    pass "containerd installed: $CTR_VER"
     if systemctl is-active containerd >/dev/null 2>&1; then
         pass "containerd service running"
     else
@@ -148,37 +185,64 @@ else
     info "No external containerd — K3s will use its own bundled version (OK)"
 fi
 
-# ── 9. Hardware ──────────────────────────────────────────────
+# ── 9. Hardware Resources ────────────────────────────────────
 header 9 "Hardware Resources"
-CPU=$(nproc 2>/dev/null || echo 0)
-RAM=$(awk '/MemTotal/{printf "%.0f", $2/1024}' /proc/meminfo 2>/dev/null || echo 0)
-DISK=$(df -BG / 2>/dev/null | awk 'NR==2{gsub("G",""); print $4}' || echo 0)
+CPU=$(nproc 2>/dev/null); CPU=${CPU:-0}
+RAM=$(awk '/MemTotal/{printf "%.0f", $2/1024}' /proc/meminfo 2>/dev/null); RAM=${RAM:-0}
+DISK_RAW=$(df -BG / 2>/dev/null | awk 'NR==2{print $4}'); DISK_RAW=${DISK_RAW:-0G}
+DISK=$(echo "$DISK_RAW" | grep -oE '^[0-9]+'); DISK=${DISK:-0}
 
-[ "$CPU"  -ge 2    ] && pass "CPU : $CPU cores"        || warn "CPU : $CPU core(s) — min 2 recommended for server"
-[ "$RAM"  -ge 2048 ] && pass "RAM : ${RAM} MB"         || warn "RAM : ${RAM} MB — min 2 GB for server / 512 MB for agent"
-[ "$DISK" -ge 10   ] && pass "Disk: ${DISK} GB free"   || warn "Disk: ${DISK} GB free — low space may cause pull failures"
+if ! is_int "$CPU";  then CPU=0;  fi
+if ! is_int "$RAM";  then RAM=0;  fi
+if ! is_int "$DISK"; then DISK=0; fi
 
-# ── 10. OS ───────────────────────────────────────────────────
+if [ "$CPU" -ge 2 ]; then
+    pass "CPU : $CPU cores"
+else
+    warn "CPU : $CPU core(s) — min 2 recommended for server node"
+fi
+
+if [ "$RAM" -ge 2048 ]; then
+    pass "RAM : ${RAM} MB"
+else
+    warn "RAM : ${RAM} MB — min 2 GB for server / 512 MB for agent"
+fi
+
+if [ "$DISK" -ge 10 ]; then
+    pass "Disk: ${DISK} GB free on /"
+else
+    warn "Disk: ${DISK} GB free — low space may cause image pull failures"
+fi
+
+# ── 10. OS Detection ─────────────────────────────────────────
 header 10 "OS Detection"
 if [ -f /etc/os-release ]; then
+    # shellcheck disable=SC1091
     . /etc/os-release
     info "OS: ${PRETTY_NAME:-unknown}"
-    case "${ID:-}" in
+    OS_ID=${ID:-unknown}
+    case "$OS_ID" in
         rhel|centos)
-            VER=$(echo "${VERSION_ID:-0}" | cut -d'.' -f1)
-            if echo "$VER" | grep -qE '^[0-9]+$'; then
-                [ "$VER" -lt 8 ]  && warn "RHEL/CentOS < 8 — disable nm-cloud-setup before K3s install" || pass "RHEL/CentOS version OK"
-                [ "$VER" -ge 10 ] && warn "RHEL 10 — run: dnf install -y kernel-modules-extra"
+            VER_RAW=${VERSION_ID:-0}
+            VER=$(echo "$VER_RAW" | cut -d'.' -f1 | grep -oE '^[0-9]+')
+            VER=${VER:-0}
+            if [ "$VER" -lt 8 ] 2>/dev/null; then
+                warn "RHEL/CentOS < 8 — disable nm-cloud-setup before K3s install"
+            else
+                pass "RHEL/CentOS version OK"
+            fi
+            if [ "$VER" -ge 10 ] 2>/dev/null; then
+                warn "RHEL 10 — run: dnf install -y kernel-modules-extra"
             fi
             ;;
         debian|raspbian)
-            warn "Debian/Raspbian — verify cgroups in /boot/firmware/cmdline.txt"
+            warn "Debian/Raspbian — verify cgroups are set in /boot/firmware/cmdline.txt"
             ;;
         ubuntu)
-            pass "Ubuntu detected — generally compatible"
+            pass "Ubuntu detected — generally compatible with K3s"
             ;;
         *)
-            info "Distro '${ID:-unknown}' — K3s works on most modern Linux systems"
+            info "Distro '$OS_ID' — K3s works on most modern Linux systems"
             ;;
     esac
 else
@@ -193,12 +257,12 @@ echo -e "${BOLD}============================================================${NC
 echo -e "  ${RED}Failures : $ERRORS${NC}"
 echo -e "  ${YELLOW}Warnings : $WARNINGS${NC}"
 echo ""
-if   [ "$ERRORS" -eq 0 ] && [ "$WARNINGS" -eq 0 ]; then
+if [ "$ERRORS" -eq 0 ] && [ "$WARNINGS" -eq 0 ]; then
     echo -e "  ${GREEN}${BOLD}All checks passed — node is ready for K3s.${NC}"
 elif [ "$ERRORS" -eq 0 ]; then
     echo -e "  ${YELLOW}${BOLD}No hard failures — review warnings before installing.${NC}"
 else
-    echo -e "  ${RED}${BOLD}$ERRORS failure(s) found — fix before installing K3s.${NC}"
+    echo -e "  ${RED}${BOLD}$ERRORS failure(s) — fix these before installing K3s.${NC}"
 fi
 echo -e "\n  Docs: https://docs.k3s.io/installation/requirements"
 echo -e "${BOLD}============================================================${NC}"
