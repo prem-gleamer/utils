@@ -196,58 +196,103 @@ if ! is_int "$CPU";  then CPU=0;  fi
 if ! is_int "$RAM";  then RAM=0;  fi
 if ! is_int "$DISK"; then DISK=0; fi
 
-if [ "$CPU" -ge 2 ]; then
+if [ "$CPU" -ge 4 ]; then
     pass "CPU : $CPU cores"
 else
-    warn "CPU : $CPU core(s) — min 2 recommended for server node"
+    fail "CPU : $CPU core(s) — minimum 4 cores required"
 fi
 
-if [ "$RAM" -ge 2048 ]; then
+if [ "$RAM" -ge 10240 ]; then
     pass "RAM : ${RAM} MB"
 else
-    warn "RAM : ${RAM} MB — min 2 GB for server / 512 MB for agent"
+    fail "RAM : ${RAM} MB — minimum 10 GB required"
 fi
 
-if [ "$DISK" -ge 10 ]; then
+if [ "$DISK" -ge 60 ]; then
     pass "Disk: ${DISK} GB free on /"
 else
-    warn "Disk: ${DISK} GB free — low space may cause image pull failures"
+    fail "Disk: ${DISK} GB free on / — minimum 60 GB required"
 fi
 
 # ── 10. OS Detection ─────────────────────────────────────────
 header 10 "OS Detection"
+
+OS_ID="unknown"
+OS_VER="unknown"
+PRETTY="unknown"
+
 if [ -f /etc/os-release ]; then
     # shellcheck disable=SC1091
     . /etc/os-release
-    info "OS: ${PRETTY_NAME:-unknown}"
     OS_ID=${ID:-unknown}
-    case "$OS_ID" in
-        rhel|centos)
-            VER_RAW=${VERSION_ID:-0}
-            VER=$(echo "$VER_RAW" | cut -d'.' -f1 | grep -oE '^[0-9]+')
-            VER=${VER:-0}
-            if [ "$VER" -lt 8 ] 2>/dev/null; then
+    OS_VER=${VERSION_ID:-unknown}
+    PRETTY=${PRETTY_NAME:-unknown}
+elif [ -f /etc/redhat-release ]; then
+    PRETTY=$(cat /etc/redhat-release)
+    OS_ID=$(echo "$PRETTY" | awk '{print tolower($1)}')
+    OS_VER=$(grep -oE '[0-9]+\.[0-9]+' /etc/redhat-release | head -1)
+elif [ -f /etc/debian_version ]; then
+    OS_ID="debian"
+    OS_VER=$(cat /etc/debian_version)
+    PRETTY="Debian $OS_VER"
+else
+    PRETTY=$(uname -s -r 2>/dev/null || echo "unknown")
+fi
+
+info "OS     : $PRETTY"
+info "Distro : $OS_ID  |  Version: $OS_VER"
+
+VER_MAJOR=$(echo "$OS_VER" | cut -d'.' -f1 | grep -oE '^[0-9]+')
+VER_MAJOR=${VER_MAJOR:-0}
+
+case "$OS_ID" in
+    rhel|centos)
+        if is_int "$VER_MAJOR"; then
+            if [ "$VER_MAJOR" -lt 8 ]; then
                 warn "RHEL/CentOS < 8 — disable nm-cloud-setup before K3s install"
             else
-                pass "RHEL/CentOS version OK"
+                pass "RHEL/CentOS $VER_MAJOR — supported"
             fi
-            if [ "$VER" -ge 10 ] 2>/dev/null; then
+            if [ "$VER_MAJOR" -ge 10 ]; then
                 warn "RHEL 10 — run: dnf install -y kernel-modules-extra"
             fi
-            ;;
-        debian|raspbian)
-            warn "Debian/Raspbian — verify cgroups are set in /boot/firmware/cmdline.txt"
-            ;;
-        ubuntu)
-            pass "Ubuntu detected — generally compatible with K3s"
-            ;;
-        *)
-            info "Distro '$OS_ID' — K3s works on most modern Linux systems"
-            ;;
-    esac
-else
-    warn "/etc/os-release not found — cannot detect OS"
-fi
+        fi
+        ;;
+    fedora)
+        pass "Fedora $OS_VER — compatible with K3s"
+        ;;
+    ubuntu)
+        pass "Ubuntu $OS_VER — compatible with K3s"
+        ;;
+    debian|raspbian)
+        pass "Debian/Raspbian $OS_VER — compatible"
+        warn "Verify cgroups in /boot/firmware/cmdline.txt on Raspberry Pi"
+        ;;
+    sles|opensuse*|suse*)
+        pass "SUSE/openSUSE $OS_VER — compatible with K3s"
+        warn "SUSE: ensure AppArmor or SELinux is configured for K3s"
+        ;;
+    alpine)
+        pass "Alpine Linux $OS_VER — compatible with K3s"
+        warn "Alpine: ensure cgroups and openrc are properly configured"
+        ;;
+    arch|manjaro)
+        pass "Arch-based $OS_ID — compatible with K3s"
+        ;;
+    amzn)
+        pass "Amazon Linux $OS_VER — compatible with K3s"
+        ;;
+    ol)
+        pass "Oracle Linux $OS_VER — compatible with K3s"
+        ;;
+    rocky|almalinux)
+        pass "$OS_ID $OS_VER — compatible with K3s"
+        ;;
+    *)
+        info "Distro '$OS_ID $OS_VER' — K3s runs on most modern Linux systems"
+        info "Verify: kernel >= 5.4, cgroups enabled, overlayfs supported"
+        ;;
+esac
 
 # ── Summary ──────────────────────────────────────────────────
 echo ""
